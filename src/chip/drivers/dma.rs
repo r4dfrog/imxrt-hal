@@ -196,7 +196,7 @@ impl<P, const N: u8> lpspi::Lpspi<P, N> {
         channel: &'a mut Channel,
         buffer: &'a [u32],
     ) -> Result<peripheral::Write<'a, Self, u32>, lpspi::LpspiError> {
-        let mut transaction = self.bus_transaction(buffer)?;
+        let mut transaction = self.bus_transaction(core::mem::size_of_val(buffer))?;
         transaction.receive_data_mask = true;
 
         self.wait_for_transmit_fifo_space()?;
@@ -215,7 +215,7 @@ impl<P, const N: u8> lpspi::Lpspi<P, N> {
         channel: &'a mut Channel,
         buffer: &'a mut [u32],
     ) -> Result<peripheral::Read<'a, Self, u32>, lpspi::LpspiError> {
-        let mut transaction = self.bus_transaction(buffer)?;
+        let mut transaction = self.bus_transaction(core::mem::size_of_val(buffer))?;
         transaction.transmit_data_mask = true;
 
         self.wait_for_transmit_fifo_space()?;
@@ -236,7 +236,7 @@ impl<P, const N: u8> lpspi::Lpspi<P, N> {
         tx: &'a mut Channel,
         buffer: &'a mut [u32],
     ) -> Result<peripheral::FullDuplex<'a, Self, u32>, lpspi::LpspiError> {
-        let transaction = self.bus_transaction(buffer)?;
+        let transaction = self.bus_transaction(core::mem::size_of_val(buffer))?;
 
         self.wait_for_transmit_fifo_space()?;
         self.enqueue_transaction(&transaction);

@@ -312,11 +312,7 @@ impl Transaction {
     }
 
     fn new_words<W>(data: &[W]) -> Result<Self, LpspiError> {
-        if let Ok(frame_size) = u16::try_from(8 * core::mem::size_of_val(data)) {
-            Transaction::new(frame_size)
-        } else {
-            Err(LpspiError::FrameSize)
-        }
+        Self::new_with_byte_length(core::mem::size_of_val(data))
     }
 
     fn frame_size_valid(frame_size: u16) -> bool {
@@ -327,6 +323,25 @@ impl Transaction {
         let last_frame_size = frame_size % WORD_SIZE;
 
         (MIN_FRAME_SIZE..=MAX_FRAME_SIZE).contains(&frame_size) && (1 != last_frame_size)
+    }
+
+    /// Define a transaction by specifying the byte length of the buffer it's transacting
+    /// over.
+    ///
+    /// The byte length describes the number of bytes that will be transferred and
+    /// received during the next transaction.
+    ///
+    /// # Requirements
+    ///
+    /// - `byte_length` fits within 9 bits, which is enforced by the implementation
+    ///   through the [`LpspiError::FrameSize`] error variant.
+    /// - `byte_length` is less than or equal to 512
+    pub fn new_with_byte_length(byte_length: usize) -> Result<Self, LpspiError> {
+        if let Ok(frame_size) = u16::try_from(8 * byte_length) {
+            Transaction::new(frame_size)
+        } else {
+            Err(LpspiError::FrameSize)
+        }
     }
 
     /// Define a transaction by specifying the frame size, in bits.
@@ -877,51 +892,82 @@ impl<P, const N: u8> Lpspi<P, N> {
         }
     }
 
-    fn exchange<W: Word>(&mut self, data: &mut [W]) -> Result<(), LpspiError> {
-        if data.is_empty() {
+    /// Perform an LPSPI transaction given a TX buffer and an RX buffer.
+    ///
+    /// The TX and RX buffers can be different lengths, and may or may not refer to
+    /// the same underlying memory. If they differ in length, the transaction is
+    /// performed with a frame size derived from the _larger_ buffer. In this case the
+    /// difference is reconciled by either inserting zeros at the end of the tx data
+    /// (if the TX buffer is smaller) or dropping overflowing rx data (if the RX
+    /// buffer is smaller). The end user is responsible for setting the correct buffer
+    /// sizes.
+    fn transact_with_buffers<W: Word>(
+        &mut self,
+        tx_buffer: TransmitBuffer<'_, W>,
+        rx_buffer: ReceiveBuffer<'_, W>,
+    ) -> Result<(), LpspiError> {
+        let max_byte_length = usize::max(tx_buffer.array_len(), rx_buffer.array_len());
+        if max_byte_length == 0 {
+            // No data to write or read!
             return Ok(());
         }
 
-        let transaction = self.bus_transaction(data)?;
-
+        let transaction = self.bus_transaction(max_byte_length)?;
         self.wait_for_transmit_fifo_space()?;
         self.enqueue_transaction(&transaction);
 
-        let word_count = word_count(data);
-        let (tx, rx) = transfer_in_place(data);
-
+        // `spin_transmit` and `spin_receive` consider words as always 4 bytes
+        // long, so just ceiling divide by four here.
+        let word_count = max_byte_length.div_ceil(4);
         crate::spin_on(futures::future::try_join(
-            self.spin_transmit(tx, word_count),
-            self.spin_receive(rx, word_count),
+            self.spin_transmit(tx_buffer, word_count),
+            self.spin_receive(rx_buffer, word_count),
         ))
         .inspect_err(|_| self.recover_from_error())?;
-
         self.flush()?;
-
         Ok(())
     }
 
-    fn write_no_read<W: Word>(&mut self, data: &[W]) -> Result<(), LpspiError> {
-        if data.is_empty() {
-            return Ok(());
-        }
+    /// Perform a SPI transaction by exchanging TX words in the buffer with RX
+    /// words received from the SPI device. This is also known as transfer-in-place.
+    fn exchange<W: Word>(&mut self, data: &mut [W]) -> Result<(), LpspiError> {
+        let (tx, rx) = transfer_in_place(data);
+        self.transact_with_buffers(tx, rx)
+    }
 
-        let mut transaction = self.bus_transaction(data)?;
-        transaction.receive_data_mask = true;
+    /// Perform a SPI transaction where we only write data to the device, and ignore
+    /// any data received from it.
+    ///
+    /// Observe that we only need an immutable slice here, since we aren't touching
+    /// the data in the buffer at all.
+    fn write_only<W: Word>(&mut self, data: &[W]) -> Result<(), LpspiError> {
+        let (tx, rx) = transfer_write_only(data);
+        self.transact_with_buffers(tx, rx)
+    }
 
-        self.wait_for_transmit_fifo_space()?;
-        self.enqueue_transaction(&transaction);
+    /// Perform a SPI transaction where we only read data from the device, and send it
+    /// zeros.
+    ///
+    /// The end user is responsible for ensuring that writing arbitrary data to the device
+    /// is OK. You and I know that these will be zero bits, but that's just an implementation
+    /// detail.
+    fn read_only<W: Word>(&mut self, data: &mut [W]) -> Result<(), LpspiError> {
+        // We can avoid having to add complexity in TransmitBuffer by pretending this is
+        // a transfer-in-place.
+        data.fill(W::ZERO);
+        let (tx, rx) = transfer_in_place(data);
+        self.transact_with_buffers(tx, rx)
+    }
 
-        let word_count = word_count(data);
-        let tx = TransmitBuffer::new(data);
-
-        crate::spin_on(self.spin_transmit(tx, word_count)).inspect_err(|_| {
-            self.recover_from_error();
-        })?;
-
-        self.flush()?;
-
-        Ok(())
+    /// Perform a SPI transaction where we write data to the device from one buffer, and
+    /// read data into another.
+    fn transfer<W: Word>(
+        &mut self,
+        write_data: &[W],
+        read_data: &mut [W],
+    ) -> Result<(), LpspiError> {
+        let (tx, rx) = transfer_asymmetric(write_data, read_data);
+        self.transact_with_buffers(tx, rx)
     }
 
     /// Let the peripheral act as a DMA source.
@@ -1057,8 +1103,8 @@ impl<P, const N: u8> Lpspi<P, N> {
     }
 
     /// Produce a transaction that considers bus-managed software state.
-    pub(crate) fn bus_transaction<W>(&self, words: &[W]) -> Result<Transaction, LpspiError> {
-        let mut transaction = Transaction::new_words(words)?;
+    pub(crate) fn bus_transaction(&self, byte_length: usize) -> Result<Transaction, LpspiError> {
+        let mut transaction = Transaction::new_with_byte_length(byte_length)?;
         transaction.bit_order = self.bit_order();
         transaction.mode = self.mode;
         Ok(transaction)
@@ -1342,7 +1388,7 @@ impl<P, const N: u8> eh02::blocking::spi::Write<u8> for Lpspi<P, N> {
     type Error = LpspiError;
 
     fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
-        self.write_no_read(words)
+        self.write_only(words)
     }
 }
 
@@ -1350,7 +1396,7 @@ impl<P, const N: u8> eh02::blocking::spi::Write<u16> for Lpspi<P, N> {
     type Error = LpspiError;
 
     fn write(&mut self, words: &[u16]) -> Result<(), Self::Error> {
-        self.write_no_read(words)
+        self.write_only(words)
     }
 }
 
@@ -1358,7 +1404,39 @@ impl<P, const N: u8> eh02::blocking::spi::Write<u32> for Lpspi<P, N> {
     type Error = LpspiError;
 
     fn write(&mut self, words: &[u32]) -> Result<(), Self::Error> {
-        self.write_no_read(words)
+        self.write_only(words)
+    }
+}
+
+impl eh1::spi::Error for LpspiError {
+    fn kind(&self) -> eh1::spi::ErrorKind {
+        eh1::spi::ErrorKind::Other
+    }
+}
+
+impl<P, const N: u8> eh1::spi::ErrorType for Lpspi<P, N> {
+    type Error = LpspiError;
+}
+
+impl<P, const N: u8> eh1::spi::SpiBus for Lpspi<P, N> {
+    fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+        self.read_only(words)
+    }
+
+    fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+        self.write_only(words)
+    }
+
+    fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+        self.exchange(words)
+    }
+
+    fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
+        self.transfer(write, read)
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        self.flush()
     }
 }
 
@@ -1368,6 +1446,9 @@ impl<P, const N: u8> eh02::blocking::spi::Write<u32> for Lpspi<P, N> {
 
 /// Describes SPI words that can participate in transactions.
 trait Word: Copy + Into<u32> + TryFrom<u32> {
+    /// The zero value for this word.
+    const ZERO: Self;
+
     /// Repeatedly call `provider` to produce yourself,
     /// then turn yourself into a LPSPI word.
     fn pack_word(bit_order: BitOrder, provider: impl FnMut() -> Option<Self>) -> u32;
@@ -1380,6 +1461,8 @@ trait Word: Copy + Into<u32> + TryFrom<u32> {
 }
 
 impl Word for u8 {
+    const ZERO: Self = 0;
+
     fn pack_word(bit_order: BitOrder, mut provider: impl FnMut() -> Option<Self>) -> u32 {
         let mut word = 0;
         match bit_order {
@@ -1415,6 +1498,8 @@ impl Word for u8 {
 }
 
 impl Word for u16 {
+    const ZERO: Self = 0;
+
     fn pack_word(bit_order: BitOrder, mut provider: impl FnMut() -> Option<Self>) -> u32 {
         let mut word = 0;
         match bit_order {
@@ -1452,6 +1537,8 @@ impl Word for u16 {
 }
 
 impl Word for u32 {
+    const ZERO: Self = 0;
+
     fn pack_word(_: BitOrder, mut provider: impl FnMut() -> Option<Self>) -> u32 {
         provider().unwrap_or(0)
     }
@@ -1480,6 +1567,7 @@ struct TransmitBuffer<'a, W> {
     ptr: *const W,
     /// At the end of the buffer.
     end: *const W,
+
     _buffer: PhantomData<&'a [W]>,
 }
 
@@ -1487,6 +1575,7 @@ impl<'a, W> TransmitBuffer<'a, W>
 where
     W: Word,
 {
+    #[cfg(test)] // TODO(mciantyre) remove once needed in non-test code.
     fn new(buffer: &'a [W]) -> Self {
         // Safety: pointer offset math meets expectations.
         unsafe { Self::from_raw(buffer.as_ptr(), buffer.len()) }
@@ -1517,6 +1606,14 @@ where
             })
         }
     }
+
+    /// Length of the not-yet-written data left in the buffer in bytes
+    fn array_len(&self) -> usize {
+        // Safety: end and ptr derive from the same allocation.
+        // We always update ptr in multiples of it's object type.
+        // The end pointer is always at a higher address in memory.
+        unsafe { self.end.byte_offset_from(self.ptr) as _ }
+    }
 }
 
 impl<W> TransmitData for TransmitBuffer<'_, W>
@@ -1530,10 +1627,8 @@ where
 
 /// Receive data into a buffer.
 struct ReceiveBuffer<'a, W> {
-    /// The write position.
-    ptr: *mut W,
-    /// At the end of the buffer.
-    end: *const W,
+    /// Write head and end pointers, if we arent an empty buffer
+    ptrs: Option<(*mut W, *const W)>,
     _buffer: PhantomData<&'a [W]>,
 }
 
@@ -1553,32 +1648,45 @@ where
     /// allocation.
     unsafe fn from_raw(ptr: *mut W, len: usize) -> Self {
         Self {
-            ptr,
             // Safety: caller upholds contract that ptr + len
             // must be in bounds, or at the end.
-            end: unsafe { ptr.cast_const().add(len) },
+            ptrs: Some((ptr, unsafe { ptr.cast_const().add(len) })),
+            _buffer: PhantomData,
+        }
+    }
+
+    fn empty() -> Self {
+        Self {
+            ptrs: None,
             _buffer: PhantomData,
         }
     }
 
     /// Put the next element into the buffer.
     fn next_write(&mut self, elem: W) {
-        // Safety: write the next word only if we're in bounds.
-        // Words are primitive types; we don't need to execute
-        // a drop when we overwrite a value in memory.
-        unsafe {
-            if !core::ptr::eq(self.ptr.cast_const(), self.end) {
-                self.ptr.write(elem);
-                self.ptr = self.ptr.add(1);
+        if let Some((ref mut ptr, end)) = self.ptrs {
+            // Safety: write the next word only if we're in bounds.
+            // Words are primitive types; we don't need to execute
+            // a drop when we overwrite a value in memory.
+            unsafe {
+                if !core::ptr::eq(ptr.cast_const(), end) {
+                    ptr.write(elem);
+                    *ptr = ptr.add(1);
+                }
             }
         }
     }
 
+    /// Length of the unfilled section of the buffer in bytes
     fn array_len(&self) -> usize {
-        // Safety: end and ptr derive from the same allocation.
-        // We always update ptr in multiples of it's object type.
-        // The end pointer is always at a higher address in memory.
-        unsafe { self.end.byte_offset_from(self.ptr) as _ }
+        if let Some((ptr, end)) = self.ptrs {
+            // Safety: end and ptr derive from the same allocation.
+            // We always update ptr in multiples of it's object type.
+            // The end pointer is always at a higher address in memory.
+            unsafe { end.byte_offset_from(ptr) as _ }
+        } else {
+            0
+        }
     }
 }
 
@@ -1590,16 +1698,6 @@ where
         let valid_bytes = self.array_len().min(size_of_val(&word));
         W::unpack_word(word, bit_order, valid_bytes, |elem| self.next_write(elem));
     }
-}
-
-/// Computes how may Ws fit inside a LPSPI word.
-const fn per_word<W: Word>() -> usize {
-    core::mem::size_of::<u32>() / core::mem::size_of::<W>()
-}
-
-/// Computes how many u32 words we need to transact this buffer.
-const fn word_count<W: Word>(words: &[W]) -> usize {
-    words.len().div_ceil(per_word::<W>())
 }
 
 /// Creates the transmit and receive buffer objects for an
@@ -1616,6 +1714,38 @@ fn transfer_in_place<W: Word>(buffer: &mut [W]) -> (TransmitBuffer<'_, W>, Recei
         (
             TransmitBuffer::from_raw(ptr, len),
             ReceiveBuffer::from_raw(ptr, len),
+        )
+    }
+}
+
+/// Initialze transmit and receive buffer objects for a write-only
+/// transfer. The receive buffer is initialized empty, meaning that
+/// all words written to it will be immediately dropped.
+fn transfer_write_only<W: Word>(buffer: &[W]) -> (TransmitBuffer<'_, W>, ReceiveBuffer<'_, W>) {
+    // Safety: pointer math meets expectation. This produces
+    // only a immutable pointer to the immutable buffer, so aliasing
+    // won't happen. We maintain the lifetime in the transmit buffer
+    // instance.
+    unsafe {
+        let len = buffer.len();
+        let ptr = buffer.as_ptr();
+        (TransmitBuffer::from_raw(ptr, len), ReceiveBuffer::empty())
+    }
+}
+
+/// Initialize transmit and receive buffer objects for an assymetric
+/// transfer, where the buffers don't refer to the same underlying memory
+/// and can be different sizes.
+fn transfer_asymmetric<'a, W: Word>(
+    write_buffer: &'a [W],
+    read_buffer: &'a mut [W],
+) -> (TransmitBuffer<'a, W>, ReceiveBuffer<'a, W>) {
+    // Safety: pointer math meets expectation. We maintain the lifetime
+    // across both objects, so the buffer isn't dropped.
+    unsafe {
+        (
+            TransmitBuffer::from_raw(write_buffer.as_ptr(), write_buffer.len()),
+            ReceiveBuffer::from_raw(read_buffer.as_mut_ptr(), read_buffer.len()),
         )
     }
 }
